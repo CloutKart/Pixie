@@ -141,7 +141,7 @@ async function embedText(text) {
 /**
  * Retrieve the most relevant prompt chunks from the Atlas vector index.
  */
-async function searchPromptChunks(query, limit = 5) {
+async function searchPromptChunks(query, limit = 3) {
   if (!query || !query.trim()) return [];
 
   try {
@@ -218,7 +218,7 @@ function escapeRegExp(str) {
  * Build a compact context block from the top matching prompt chunks.
  */
 async function buildRagContext(query) {
-  const chunks = await searchPromptChunks(query, 5);
+  const chunks = await searchPromptChunks(query, 3);
   if (!chunks.length) return "";
 
   const parts = [];
@@ -235,7 +235,11 @@ async function buildRagContext(query) {
     parts.push(block);
     totalChars += block.length;
   }
-
+  console.log("\n[RAG] Retrieved Chunks:");
+  chunks.forEach((c, i) => {
+  console.log(`${i + 1}. ${c.title}`);
+});
+console.log("");
   return parts.join("\n\n---\n\n");
 }
 
@@ -320,6 +324,17 @@ Whenever it naturally fits, guide people toward:
 5. **Booking a discovery call** — for anyone who sounds like a serious fit
 
 Never be pushy. Weave it in naturally — be helpful first, let the CTA feel like the obvious next step.
+
+##When generating ad concepts:
+
+- Use cinematic shot structures
+- Use clear shot sequencing
+- Use camera/lens terminology
+- Use structured vibe systems
+- Use CloutKart prompt-library terminology naturally
+- Prefer concrete visual direction over vague aesthetics
+- Use high-conversion direct-response thinking
+- Responses should feel like a premium creative director, not a generic chatbot
 
 ## What You Know
 - Performance marketing, D2C growth, creative testing, Meta and TikTok ads, hooks, UGC, and brand strategy.
@@ -461,7 +476,19 @@ async function askGroq(history, hasImages, rawUserContent, ragContext = "") {
   const baseSystemPrompt = await buildSystemPrompt();
 
   const ragBlock = ragContext
-    ? `\n\n## Relevant CloutKart Prompt Library Context\nUse this context when it is relevant to the user's question:\n${ragContext}`
+    ? `\n\n## Relevant CloutKart Prompt Library Context\nThe following is authoritative CloutKart prompt-library knowledge.
+
+You MUST:
+- preserve the structure of retrieved prompts
+- preserve shot structures
+- preserve vibe structures
+- preserve cinematic language
+- preserve camera terminology
+- preserve motion terminology
+- preserve formatting patterns
+
+Do NOT summarize the context.
+Use it directly when relevant.\n${ragContext}`
     : "";
 
   const systemPrompt = baseSystemPrompt + ragBlock;
