@@ -1,12 +1,19 @@
 // =============================================================================
 // Discord Bot — Pixie by CloutKart
-// Stack: discord.js v14+, groq-sdk, mongodb, dotenv
+// Stack: discord.js v14+, groq-sdk, mongodb, dotenv, @xenova/transformers
 // =============================================================================
 
-import { Client, GatewayIntentBits, Events, ActivityType, PermissionFlagsBits } from "discord.js";
+import {
+  Client,
+  GatewayIntentBits,
+  Events,
+  ActivityType,
+  PermissionFlagsBits,
+} from "discord.js";
 import Groq from "groq-sdk";
 import { MongoClient } from "mongodb";
 import dotenv from "dotenv";
+import { pipeline } from "@xenova/transformers";
 
 dotenv.config();
 
@@ -14,7 +21,16 @@ dotenv.config();
 // SECTION 1: VALIDATE ENV
 // =============================================================================
 
-const { DISCORD_TOKEN, GROQ_API_KEY, MONGODB_URI, BOT_OWNER_ID } = process.env;
+const {
+  DISCORD_TOKEN,
+  GROQ_API_KEY,
+  MONGODB_URI,
+  BOT_OWNER_ID,
+  MONGODB_DB_NAME = "cloutkart",
+  KNOWLEDGE_COLLECTION_NAME = "knowledge",
+  PROMPT_COLLECTION_NAME = "prompt_chunks",
+  VECTOR_INDEX_NAME = "vector_index",
+} = process.env;
 
 if (!DISCORD_TOKEN || !GROQ_API_KEY || !MONGODB_URI) {
   console.error("[FATAL] Missing DISCORD_TOKEN, GROQ_API_KEY, or MONGODB_URI in .env");
@@ -29,18 +45,26 @@ if (!BOT_OWNER_ID) {
 // SECTION 2: MONGODB SETUP
 // =============================================================================
 
+let mongoClient;
+let db;
 let knowledgeCollection;
+let promptCollection;
 
 async function connectMongo() {
-  const mongo = new MongoClient(MONGODB_URI);
-  await mongo.connect();
-  const db = mongo.db("pixie");
-  knowledgeCollection = db.collection("knowledge");
-  // Index for fast full-text search on the 'fact' field
+  mongoClient = new MongoClient(MONGODB_URI);
+  await mongoClient.connect();
+
+  db = mongoClient.db(MONGODB_DB_NAME);
+  knowledgeCollection = db.collection(KNOWLEDGE_COLLECTION_NAME);
+  promptCollection = db.collection(PROMPT_COLLECTION_NAME);
+
+  // Manual knowledge indexes
   await knowledgeCollection.createIndex({ fact: "text" });
-  // Index for looking up by topic tag
   await knowledgeCollection.createIndex({ topic: 1 });
-  console.log("[MongoDB] Connected and indexes ensured.");
+  await knowledgeCollection.createIndex({ addedAt: 1 });
+
+  console.log(`[MongoDB] Connected to db="${MONGODB_DB_NAME}"`);
+  console.log(`[MongoDB] knowledge="${KNOWLEDGE_COLLECTION_NAME}" prompt_chunks="${PROMPT_COLLECTION_NAME}"`);
 }
 
 /**
@@ -50,7 +74,7 @@ async function connectMongo() {
 async function saveFact(fact, topic, addedBy) {
   await knowledgeCollection.insertOne({
     fact,
-    topic:   topic || "general",
+    topic: topic || "general",
     addedBy,
     addedAt: new Date(),
   });
@@ -73,7 +97,7 @@ async function deleteFact(index) {
  */
 async function getAllFacts() {
   const docs = await knowledgeCollection.find({}).sort({ addedAt: 1 }).toArray();
-  return docs.map(d => `[${d.topic}] ${d.fact}`);
+  return docs.map((d) => `[${d.topic}] ${d.fact}`);
 }
 
 /**
@@ -84,23 +108,155 @@ async function getFactsByTopic(topic) {
     .find({ topic: { $regex: new RegExp(topic, "i") } })
     .sort({ addedAt: 1 })
     .toArray();
-  return docs.map(d => `[${d.topic}] ${d.fact}`);
+  return docs.map((d) => `[${d.topic}] ${d.fact}`);
 }
 
 // =============================================================================
-// SECTION 3: GROQ + MODELS
+// SECTION 3: EMBEDDINGS FOR RETRIEVAL
+// =============================================================================
+
+let embedder = null;
+
+async function getEmbedder() {
+  if (!embedder) {
+    embedder = await pipeline(
+      "feature-extraction",
+      "Xenova/all-MiniLM-L6-v2",
+      { quantized: true }
+    );
+  }
+  return embedder;
+}
+
+async function embedText(text) {
+  const model = await getEmbedder();
+  const result = await model(text, {
+    pooling: "mean",
+    normalize: true,
+  });
+
+  return Array.from(result.data);
+}
+
+/**
+ * Retrieve the most relevant prompt chunks from the Atlas vector index.
+ */
+async function searchPromptChunks(query, limit = 5) {
+  if (!query || !query.trim()) return [];
+
+  try {
+    const queryVector = await embedText(query);
+
+    const docs = await promptCollection
+      .aggregate([
+        {
+          $vectorSearch: {
+            index: VECTOR_INDEX_NAME,
+            path: "embedding",
+            queryVector,
+            numCandidates: 100,
+            limit,
+          },
+        },
+        {
+          $project: {
+            _id: 0,
+            title: 1,
+            platform: 1,
+            category: 1,
+            type: 1,
+            content: 1,
+            score: { $meta: "vectorSearchScore" },
+          },
+        },
+      ])
+      .toArray();
+
+    return docs;
+  } catch (err) {
+    console.warn("[RAG] Vector search failed, falling back to regex search:", err?.message || err);
+
+    const words = query
+      .toLowerCase()
+      .split(/\s+/)
+      .filter((w) => w.length >= 4)
+      .slice(0, 6);
+
+    if (words.length === 0) return [];
+
+    const regex = new RegExp(words.map((w) => escapeRegExp(w)).join("|"), "i");
+
+    const fallback = await promptCollection
+      .find({
+        $or: [
+          { title: regex },
+          { content: regex },
+          { platform: regex },
+          { category: regex },
+          { type: regex },
+        ],
+      })
+      .limit(limit)
+      .toArray();
+
+    return fallback.map((d) => ({
+      title: d.title,
+      platform: d.platform,
+      category: d.category,
+      type: d.type,
+      content: d.content,
+      score: null,
+    }));
+  }
+}
+
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Build a compact context block from the top matching prompt chunks.
+ */
+async function buildRagContext(query) {
+  const chunks = await searchPromptChunks(query, 5);
+  if (!chunks.length) return "";
+
+  const parts = [];
+  let totalChars = 0;
+  const maxChars = 9000;
+
+  for (const chunk of chunks) {
+    const header = `[${chunk.platform || "general"} / ${chunk.category || "general"} / ${chunk.type || "general"}] ${chunk.title || "Untitled"}`;
+    const body = (chunk.content || "").trim();
+
+    const block = `${header}\n${body}`;
+    if (totalChars + block.length > maxChars) break;
+
+    parts.push(block);
+    totalChars += block.length;
+  }
+
+  return parts.join("\n\n---\n\n");
+}
+
+// =============================================================================
+// SECTION 4: GROQ + MODELS
 // =============================================================================
 
 const groq = new Groq({ apiKey: GROQ_API_KEY });
 
-const TEXT_MODEL   = "llama-3.3-70b-versatile";
+const TEXT_MODEL = "llama-3.3-70b-versatile";
 const VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 
-const TOKEN_LIMIT          = 12000;
-const REPLY_BUFFER         = 1200;
+const TOKEN_LIMIT = 12000;
+const REPLY_BUFFER = 1200;
 const SYSTEM_PROMPT_TOKENS = 950;
-const MAX_HISTORY_TOKENS   = TOKEN_LIMIT - REPLY_BUFFER - SYSTEM_PROMPT_TOKENS;
+const MAX_HISTORY_TOKENS = TOKEN_LIMIT - REPLY_BUFFER - SYSTEM_PROMPT_TOKENS;
 
+/**
+ * Keep your existing BASE_SYSTEM_PROMPT from the current file unchanged.
+ * The only change is: manual facts + retrieved prompt chunks are appended later.
+ */
 const BASE_SYSTEM_PROMPT = `You are Pixie — the AI assistant and creative intelligence behind CloutKart.
 
 ## Who You Are
@@ -191,7 +347,7 @@ async function buildSystemPrompt() {
 }
 
 // =============================================================================
-// SECTION 4: TOKEN ESTIMATION
+// SECTION 5: TOKEN ESTIMATION
 // =============================================================================
 
 function estimateTokens(text) {
@@ -199,12 +355,24 @@ function estimateTokens(text) {
   return Math.ceil(text.length / 3.5);
 }
 
+function contentToString(content) {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((p) => p.type === "text")
+      .map((p) => p.text || "")
+      .join(" ")
+      .trim() || "[image]";
+  }
+  return String(content);
+}
+
 function messageTokens(msg) {
   return estimateTokens(contentToString(msg.content)) + 4;
 }
 
 // =============================================================================
-// SECTION 5: CONVERSATION HISTORY
+// SECTION 6: CONVERSATION HISTORY
 // =============================================================================
 
 const userHistories = new Map();
@@ -217,42 +385,30 @@ function getHistory(userId) {
   return userHistories.get(userId);
 }
 
-function contentToString(content) {
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) {
-    return content
-      .filter(p => p.type === "text")
-      .map(p => p.text || "")
-      .join(" ")
-      .trim() || "[image]";
-  }
-  return String(content);
-}
-
 function pushToHistory(userId, userContent, assistantText) {
   const h = getHistory(userId);
-  h.push({ role: "user",      content: contentToString(userContent) });
-  h.push({ role: "assistant", content: assistantText                 });
+  h.push({ role: "user", content: contentToString(userContent) });
+  h.push({ role: "assistant", content: assistantText });
   while (h.length > 60) h.splice(0, 2);
 }
 
 function sanitizeHistory(messages) {
-  return messages.map(m => ({
-    role:    m.role,
+  return messages.map((m) => ({
+    role: m.role,
     content: contentToString(m.content),
   }));
 }
 
 function buildTokenSafeMessages(systemPrompt, history, newUserContent) {
-  const newUserMsg    = { role: "user", content: contentToString(newUserContent) };
+  const newUserMsg = { role: "user", content: contentToString(newUserContent) };
   const newUserTokens = messageTokens(newUserMsg);
-  const sysTokens     = estimateTokens(systemPrompt) + 4;
+  const sysTokens = estimateTokens(systemPrompt) + 4;
   let budget = TOKEN_LIMIT - REPLY_BUFFER - sysTokens - newUserTokens;
 
   const keptHistory = [];
   for (let i = history.length - 1; i >= 1; i -= 2) {
     const assistantMsg = history[i];
-    const userMsg      = history[i - 1];
+    const userMsg = history[i - 1];
     if (!assistantMsg || !userMsg) break;
     const pairTokens = messageTokens(userMsg) + messageTokens(assistantMsg);
     if (pairTokens > budget) {
@@ -264,7 +420,11 @@ function buildTokenSafeMessages(systemPrompt, history, newUserContent) {
     keptHistory.unshift(userMsg);
   }
 
-  const totalEstimate = sysTokens + keptHistory.reduce((s, m) => s + messageTokens(m), 0) + newUserTokens;
+  const totalEstimate =
+    sysTokens +
+    keptHistory.reduce((s, m) => s + messageTokens(m), 0) +
+    newUserTokens;
+
   console.log(`[Tokens] ~${totalEstimate} input tokens | ${keptHistory.length / 2} history turns kept`);
 
   return [
@@ -275,56 +435,60 @@ function buildTokenSafeMessages(systemPrompt, history, newUserContent) {
 }
 
 // =============================================================================
-// SECTION 6: GROQ API CALL
+// SECTION 7: GROQ API CALL
 // =============================================================================
 
-async function askGroq(history, hasImages, rawUserContent) {
+async function askGroq(history, hasImages, rawUserContent, ragContext = "") {
   if (hasImages) {
     const systemPrompt = await buildSystemPrompt();
     console.log(`[Groq] model=${VISION_MODEL} (vision, single-turn)`);
+
     const res = await groq.chat.completions.create({
-      model:       VISION_MODEL,
+      model: VISION_MODEL,
       messages: [
         { role: "system", content: systemPrompt },
-        { role: "user",   content: rawUserContent },
+        { role: "user", content: rawUserContent },
       ],
-      max_tokens:  1200,
+      max_tokens: 1200,
       temperature: 0.7,
     });
+
     const text = res.choices?.[0]?.message?.content?.trim();
     if (!text) throw new Error("Empty response from Groq (vision).");
     return text;
   }
 
-  const systemPrompt = await buildSystemPrompt();
-  const messages     = buildTokenSafeMessages(systemPrompt, history, rawUserContent);
-  const sanitized    = sanitizeHistory(messages);
+  const baseSystemPrompt = await buildSystemPrompt();
+
+  const ragBlock = ragContext
+    ? `\n\n## Relevant CloutKart Prompt Library Context\nUse this context when it is relevant to the user's question:\n${ragContext}`
+    : "";
+
+  const systemPrompt = baseSystemPrompt + ragBlock;
+  const messages = buildTokenSafeMessages(systemPrompt, history, rawUserContent);
+  const sanitized = sanitizeHistory(messages);
 
   console.log(`[Groq] model=${TEXT_MODEL} messages=${sanitized.length}`);
 
   const res = await groq.chat.completions.create({
-    model:       TEXT_MODEL,
-    messages:    sanitized,
-    max_tokens:  1200,
+    model: TEXT_MODEL,
+    messages: sanitized,
+    max_tokens: 1200,
     temperature: 0.7,
   });
+
   const text = res.choices?.[0]?.message?.content?.trim();
   if (!text) throw new Error("Empty response from Groq (text).");
   return text;
 }
 
 // =============================================================================
-// SECTION 7: PERMISSION HELPERS
+// SECTION 8: PERMISSION HELPERS
 // =============================================================================
 
-/**
- * Returns true if the message author is allowed to use admin commands.
- * Allowed if: they are the BOT_OWNER_ID, OR they have the Administrator
- * or ManageGuild permission in the current server.
- */
 function isAuthorized(message) {
   if (BOT_OWNER_ID && message.author.id === BOT_OWNER_ID) return true;
-  if (!message.member) return false; // DM with no guild context
+  if (!message.member) return false;
   return (
     message.member.permissions.has(PermissionFlagsBits.Administrator) ||
     message.member.permissions.has(PermissionFlagsBits.ManageGuild)
@@ -332,10 +496,10 @@ function isAuthorized(message) {
 }
 
 // =============================================================================
-// SECTION 8: HELPERS
+// SECTION 9: HELPERS
 // =============================================================================
 
-const SUPPORTED_IMAGES = new Set(["image/jpeg","image/png","image/webp","image/gif"]);
+const SUPPORTED_IMAGES = new Set(["image/jpeg", "image/png", "image/webp", "image/gif"]);
 
 async function fetchImagePart(url, mimeType) {
   const r = await fetch(url);
@@ -363,7 +527,7 @@ function chunkText(text, max = 1990) {
 }
 
 // =============================================================================
-// SECTION 9: DISCORD CLIENT
+// SECTION 10: DISCORD CLIENT
 // =============================================================================
 
 const client = new Client({
@@ -385,7 +549,7 @@ client.once(Events.ClientReady, (c) => {
 });
 
 // =============================================================================
-// SECTION 10: MESSAGE HANDLER
+// SECTION 11: MESSAGE HANDLER
 // =============================================================================
 
 client.on(Events.MessageCreate, async (message) => {
@@ -429,8 +593,6 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   // ── !teach ─────────────────────────────────────────────────────────────────
-  // Usage:  !teach <fact>
-  //         !teach topic:<tag> <fact>
   if (cmd.startsWith("!teach")) {
     if (!isAuthorized(message)) {
       return message.reply("🔒 Only server admins or the bot owner can teach Pixie new things.");
@@ -449,7 +611,7 @@ client.on(Events.MessageCreate, async (message) => {
     const topicMatch = body.match(/^topic:(\S+)\s+([\s\S]+)$/i);
     if (topicMatch) {
       topic = topicMatch[1].toLowerCase();
-      body  = topicMatch[2].trim();
+      body = topicMatch[2].trim();
     }
 
     await saveFact(body, topic, message.author.tag);
@@ -458,8 +620,6 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   // ── !knowledge ─────────────────────────────────────────────────────────────
-  // Usage:  !knowledge
-  //         !knowledge topic:<tag>
   if (cmd.startsWith("!knowledge")) {
     if (!isAuthorized(message)) {
       return message.reply("🔒 Only server admins or the bot owner can view Pixie's knowledge base.");
@@ -491,7 +651,6 @@ client.on(Events.MessageCreate, async (message) => {
   }
 
   // ── !forget ────────────────────────────────────────────────────────────────
-  // Usage:  !forget <number>
   if (cmd.startsWith("!forget")) {
     if (!isAuthorized(message)) {
       return message.reply("🔒 Only server admins or the bot owner can remove facts.");
@@ -520,7 +679,9 @@ client.on(Events.MessageCreate, async (message) => {
   try {
     await message.channel.sendTyping();
     typing = setInterval(() => message.channel.sendTyping(), 8000);
-  } catch { /* non-critical */ }
+  } catch {
+    /* non-critical */
+  }
 
   const done = () => clearInterval(typing);
 
@@ -528,6 +689,7 @@ client.on(Events.MessageCreate, async (message) => {
     // ── Build user content ───────────────────────────────────────────────────
     let userContent;
     let hasImages = false;
+    let ragContext = "";
 
     if (message.attachments.size > 0) {
       const parts = [{ type: "text", text: prompt || "Describe this image in detail." }];
@@ -543,17 +705,26 @@ client.on(Events.MessageCreate, async (message) => {
         hasImages = true;
       }
 
-      if (!hasImages && !prompt) { done(); return; }
+      if (!hasImages && !prompt) {
+        done();
+        return;
+      }
+
       userContent = parts;
     } else {
       userContent = prompt;
+
+      // Only retrieve prompt-library chunks for normal text questions
+      if (prompt && !cmd.startsWith("!")) {
+        ragContext = await buildRagContext(prompt);
+      }
     }
 
     // ── Call Groq ────────────────────────────────────────────────────────────
     const history = getHistory(message.author.id);
     console.log(`[Groq] ${message.author.tag} | stored turns=${history.length / 2} images=${hasImages}`);
 
-    const reply = await askGroq(history, hasImages, userContent);
+    const reply = await askGroq(history, hasImages, userContent, ragContext);
     pushToHistory(message.author.id, userContent, reply);
     done();
 
@@ -561,32 +732,35 @@ client.on(Events.MessageCreate, async (message) => {
     for (let i = 0; i < chunks.length; i++) {
       await (i === 0 ? message.reply(chunks[i]) : message.channel.send(chunks[i]));
     }
-
   } catch (err) {
     done();
     console.error(`[Error] ${message.author.tag}:`, err);
 
     let msg = "❌ Something went wrong. Please try again.";
-    if (err?.status === 429)                      msg = "⏳ Rate limited — wait a moment and try again.";
-    if (err?.status === 401)                      msg = "❌ Bad API key — contact the bot admin.";
-    if (err?.status === 503)                      msg = "🔧 Groq is overloaded — try again in a few seconds.";
+    if (err?.status === 429) msg = "⏳ Rate limited — wait a moment and try again.";
+    if (err?.status === 401) msg = "❌ Bad API key — contact the bot admin.";
+    if (err?.status === 503) msg = "🔧 Groq is overloaded — try again in a few seconds.";
     if (err?.message?.includes("decommissioned")) msg = "❌ Model retired — contact the bot admin to update.";
-    if (err?.message?.includes("Image fetch"))    msg = "❌ Couldn't download your image. Try re-uploading it.";
-    if (err?.code === 50013)                      msg = "❌ Missing permission to send messages here.";
+    if (err?.message?.includes("Image fetch")) msg = "❌ Couldn't download your image. Try re-uploading it.";
+    if (err?.code === 50013) msg = "❌ Missing permission to send messages here.";
 
-    try { await message.reply(msg); } catch { /* already logged */ }
+    try {
+      await message.reply(msg);
+    } catch {
+      /* already logged */
+    }
   }
 });
 
 // =============================================================================
-// SECTION 11: PROCESS SAFETY
+// SECTION 12: PROCESS SAFETY
 // =============================================================================
 
 process.on("unhandledRejection", (r) => console.error("[Process] Unhandled rejection:", r));
-process.on("uncaughtException",  (e) => console.error("[Process] Uncaught exception:",  e));
+process.on("uncaughtException", (e) => console.error("[Process] Uncaught exception:", e));
 
 // =============================================================================
-// SECTION 12: BOOT
+// SECTION 13: BOOT
 // =============================================================================
 
 console.log("🚀 Starting Pixie...");
