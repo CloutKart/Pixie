@@ -1,10 +1,11 @@
 // =============================================================================
 // Discord Bot — Pixie by CloutKart
-// Stack: discord.js v14+, groq-sdk, dotenv
+// Stack: discord.js v14+, groq-sdk, mongodb, dotenv
 // =============================================================================
 
-import { Client, GatewayIntentBits, Events, ActivityType } from "discord.js";
+import { Client, GatewayIntentBits, Events, ActivityType, PermissionFlagsBits } from "discord.js";
 import Groq from "groq-sdk";
+import { MongoClient } from "mongodb";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -13,15 +14,81 @@ dotenv.config();
 // SECTION 1: VALIDATE ENV
 // =============================================================================
 
-const { DISCORD_TOKEN, GROQ_API_KEY } = process.env;
+const { DISCORD_TOKEN, GROQ_API_KEY, MONGODB_URI, BOT_OWNER_ID } = process.env;
 
-if (!DISCORD_TOKEN || !GROQ_API_KEY) {
-  console.error("[FATAL] Missing DISCORD_TOKEN or GROQ_API_KEY in .env");
+if (!DISCORD_TOKEN || !GROQ_API_KEY || !MONGODB_URI) {
+  console.error("[FATAL] Missing DISCORD_TOKEN, GROQ_API_KEY, or MONGODB_URI in .env");
   process.exit(1);
 }
 
+if (!BOT_OWNER_ID) {
+  console.warn("[WARN] BOT_OWNER_ID not set — only server admins will be able to use !teach");
+}
+
 // =============================================================================
-// SECTION 2: GROQ + MODELS
+// SECTION 2: MONGODB SETUP
+// =============================================================================
+
+let knowledgeCollection;
+
+async function connectMongo() {
+  const mongo = new MongoClient(MONGODB_URI);
+  await mongo.connect();
+  const db = mongo.db("pixie");
+  knowledgeCollection = db.collection("knowledge");
+  // Index for fast full-text search on the 'fact' field
+  await knowledgeCollection.createIndex({ fact: "text" });
+  // Index for looking up by topic tag
+  await knowledgeCollection.createIndex({ topic: 1 });
+  console.log("[MongoDB] Connected and indexes ensured.");
+}
+
+/**
+ * Save a new fact to MongoDB.
+ * Each entry: { fact, topic, addedBy, addedAt }
+ */
+async function saveFact(fact, topic, addedBy) {
+  await knowledgeCollection.insertOne({
+    fact,
+    topic:   topic || "general",
+    addedBy,
+    addedAt: new Date(),
+  });
+}
+
+/**
+ * Delete a fact by its 1-based index in the full list.
+ * Returns true if something was deleted.
+ */
+async function deleteFact(index) {
+  const all = await knowledgeCollection.find({}).sort({ addedAt: 1 }).toArray();
+  const target = all[index - 1];
+  if (!target) return false;
+  await knowledgeCollection.deleteOne({ _id: target._id });
+  return true;
+}
+
+/**
+ * Fetch all stored facts as plain strings for injection into the system prompt.
+ */
+async function getAllFacts() {
+  const docs = await knowledgeCollection.find({}).sort({ addedAt: 1 }).toArray();
+  return docs.map(d => `[${d.topic}] ${d.fact}`);
+}
+
+/**
+ * Fetch facts filtered by topic tag.
+ */
+async function getFactsByTopic(topic) {
+  const docs = await knowledgeCollection
+    .find({ topic: { $regex: new RegExp(topic, "i") } })
+    .sort({ addedAt: 1 })
+    .toArray();
+  return docs.map(d => `[${d.topic}] ${d.fact}`);
+}
+
+// =============================================================================
+// SECTION 3: GROQ + MODELS
 // =============================================================================
 
 const groq = new Groq({ apiKey: GROQ_API_KEY });
@@ -29,15 +96,12 @@ const groq = new Groq({ apiKey: GROQ_API_KEY });
 const TEXT_MODEL   = "llama-3.3-70b-versatile";
 const VISION_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct";
 
-// Token budget — keep total well under Groq's 12,000 TPM limit.
-// System prompt (~900 tokens) + reply buffer (1,200) + history = MAX_HISTORY_TOKENS.
-const TOKEN_LIMIT         = 12000;
-const REPLY_BUFFER        = 1200;  // headroom for the model's reply
-const SYSTEM_PROMPT_TOKENS = 950;  // rough estimate for the system prompt below
-const MAX_HISTORY_TOKENS  = TOKEN_LIMIT - REPLY_BUFFER - SYSTEM_PROMPT_TOKENS;
-// ≈ 9,850 tokens available for history + new user message
+const TOKEN_LIMIT          = 12000;
+const REPLY_BUFFER         = 1200;
+const SYSTEM_PROMPT_TOKENS = 950;
+const MAX_HISTORY_TOKENS   = TOKEN_LIMIT - REPLY_BUFFER - SYSTEM_PROMPT_TOKENS;
 
-const SYSTEM_PROMPT = `You are Pixie — the AI assistant and creative intelligence behind CloutKart.
+const BASE_SYSTEM_PROMPT = `You are Pixie — the AI assistant and creative intelligence behind CloutKart.
 
 ## Who You Are
 You were built by Shivam Bailwal, co-founder of CloutKart. You represent the CloutKart brand in every conversation — warm, sharp, and genuinely excited about helping brands grow through better creative.
@@ -107,32 +171,40 @@ Never be pushy. Weave it in naturally — be helpful first, let the CTA feel lik
 - If someone shares their brand or product, treat it like a creative brief and bring real ideas.
 - You never pretend to be human. If asked: "Yep, I'm Pixie — CloutKart's AI assistant. Built by Shivam. Powered by good taste."`;
 
+/**
+ * Builds the full system prompt by appending any learned facts from MongoDB.
+ * Facts are injected as a clearly labelled section so Pixie treats them
+ * as authoritative knowledge.
+ */
+async function buildSystemPrompt() {
+  const facts = await getAllFacts();
+  if (facts.length === 0) return BASE_SYSTEM_PROMPT;
+
+  const knowledgeBlock = facts
+    .map((f, i) => `${i + 1}. ${f}`)
+    .join("\n");
+
+  return (
+    BASE_SYSTEM_PROMPT +
+    `\n\n## What You've Been Taught (Treat as Ground Truth)\nThe following facts were added by CloutKart admins. Always use them when relevant:\n${knowledgeBlock}`
+  );
+}
+
 // =============================================================================
-// SECTION 3: TOKEN ESTIMATION
+// SECTION 4: TOKEN ESTIMATION
 // =============================================================================
 
-/**
- * Fast, conservative token estimator (~4 chars per token).
- * Slightly over-estimates to stay safely under the limit.
- */
 function estimateTokens(text) {
   if (!text) return 0;
-  return Math.ceil(text.length / 3.5); // conservative: ~3.5 chars/token
+  return Math.ceil(text.length / 3.5);
 }
 
-/**
- * Returns the estimated token cost of a single message object.
- */
 function messageTokens(msg) {
-  return estimateTokens(contentToString(msg.content)) + 4; // +4 for role/overhead
+  return estimateTokens(contentToString(msg.content)) + 4;
 }
 
 // =============================================================================
-// SECTION 4: CONVERSATION HISTORY
-// Map<userId, Array<{role, content}>>
-// IMPORTANT: content is ALWAYS stored as a plain string.
-// Array content (from vision messages) is flattened to text before storing.
-// This prevents the "messages[N].content must be a string" Groq error.
+// SECTION 5: CONVERSATION HISTORY
 // =============================================================================
 
 const userHistories = new Map();
@@ -140,15 +212,11 @@ const userHistories = new Map();
 function getHistory(userId) {
   if (!userHistories.has(userId)) {
     console.log(`[Chat] New session for ${userId}`);
-    userHistories.set(userId, []); // system prompt is injected at call time
+    userHistories.set(userId, []);
   }
   return userHistories.get(userId);
 }
 
-/**
- * Extracts a plain string from any content value.
- * Handles: string, array of parts (vision messages), or anything else.
- */
 function contentToString(content) {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -165,14 +233,9 @@ function pushToHistory(userId, userContent, assistantText) {
   const h = getHistory(userId);
   h.push({ role: "user",      content: contentToString(userContent) });
   h.push({ role: "assistant", content: assistantText                 });
-  // Hard cap: never store more than 30 turns (60 messages) regardless of tokens
   while (h.length > 60) h.splice(0, 2);
 }
 
-/**
- * Sanitizes a history array before sending to Groq.
- * Ensures every message's content is a plain string.
- */
 function sanitizeHistory(messages) {
   return messages.map(m => ({
     role:    m.role,
@@ -180,34 +243,20 @@ function sanitizeHistory(messages) {
   }));
 }
 
-/**
- * Builds the final messages array for a Groq text call.
- *
- * Strategy:
- *  1. Always include the system prompt.
- *  2. Always include the latest user message.
- *  3. Fill remaining token budget with the most recent history pairs,
- *     working backwards until we'd exceed MAX_HISTORY_TOKENS.
- *
- * This guarantees the request never exceeds TOKEN_LIMIT regardless of
- * how long the conversation history has grown.
- */
-function buildTokenSafeMessages(history, newUserContent) {
-  const newUserMsg   = { role: "user", content: contentToString(newUserContent) };
+function buildTokenSafeMessages(systemPrompt, history, newUserContent) {
+  const newUserMsg    = { role: "user", content: contentToString(newUserContent) };
   const newUserTokens = messageTokens(newUserMsg);
+  const sysTokens     = estimateTokens(systemPrompt) + 4;
+  let budget = TOKEN_LIMIT - REPLY_BUFFER - sysTokens - newUserTokens;
 
-  let budget = MAX_HISTORY_TOKENS - newUserTokens;
   const keptHistory = [];
-
-  // Walk backwards through stored history, keeping pairs that fit
   for (let i = history.length - 1; i >= 1; i -= 2) {
     const assistantMsg = history[i];
     const userMsg      = history[i - 1];
     if (!assistantMsg || !userMsg) break;
-
     const pairTokens = messageTokens(userMsg) + messageTokens(assistantMsg);
     if (pairTokens > budget) {
-      console.log(`[Tokens] Trimmed ${(history.length - 1 - i) / 2 + 1}+ old turns to stay under limit.`);
+      console.log(`[Tokens] Trimmed history at turn ${Math.floor(i / 2)} to stay under limit.`);
       break;
     }
     budget -= pairTokens;
@@ -215,28 +264,28 @@ function buildTokenSafeMessages(history, newUserContent) {
     keptHistory.unshift(userMsg);
   }
 
-  const totalEstimate = SYSTEM_PROMPT_TOKENS + keptHistory.reduce((s, m) => s + messageTokens(m), 0) + newUserTokens;
-  console.log(`[Tokens] Estimated input tokens: ~${totalEstimate} | History turns kept: ${keptHistory.length / 2}`);
+  const totalEstimate = sysTokens + keptHistory.reduce((s, m) => s + messageTokens(m), 0) + newUserTokens;
+  console.log(`[Tokens] ~${totalEstimate} input tokens | ${keptHistory.length / 2} history turns kept`);
 
   return [
-    { role: "system", content: SYSTEM_PROMPT },
+    { role: "system", content: systemPrompt },
     ...keptHistory,
     newUserMsg,
   ];
 }
 
 // =============================================================================
-// SECTION 5: GROQ API CALL
+// SECTION 6: GROQ API CALL
 // =============================================================================
 
 async function askGroq(history, hasImages, rawUserContent) {
   if (hasImages) {
-    // Vision call — single turn, array content is fine here
+    const systemPrompt = await buildSystemPrompt();
     console.log(`[Groq] model=${VISION_MODEL} (vision, single-turn)`);
     const res = await groq.chat.completions.create({
       model:       VISION_MODEL,
       messages: [
-        { role: "system", content: SYSTEM_PROMPT },
+        { role: "system", content: systemPrompt },
         { role: "user",   content: rawUserContent },
       ],
       max_tokens:  1200,
@@ -247,9 +296,9 @@ async function askGroq(history, hasImages, rawUserContent) {
     return text;
   }
 
-  // Build token-safe message array from history + new message
-  const messages  = buildTokenSafeMessages(history, rawUserContent);
-  const sanitized = sanitizeHistory(messages);
+  const systemPrompt = await buildSystemPrompt();
+  const messages     = buildTokenSafeMessages(systemPrompt, history, rawUserContent);
+  const sanitized    = sanitizeHistory(messages);
 
   console.log(`[Groq] model=${TEXT_MODEL} messages=${sanitized.length}`);
 
@@ -265,7 +314,25 @@ async function askGroq(history, hasImages, rawUserContent) {
 }
 
 // =============================================================================
-// SECTION 6: HELPERS
+// SECTION 7: PERMISSION HELPERS
+// =============================================================================
+
+/**
+ * Returns true if the message author is allowed to use admin commands.
+ * Allowed if: they are the BOT_OWNER_ID, OR they have the Administrator
+ * or ManageGuild permission in the current server.
+ */
+function isAuthorized(message) {
+  if (BOT_OWNER_ID && message.author.id === BOT_OWNER_ID) return true;
+  if (!message.member) return false; // DM with no guild context
+  return (
+    message.member.permissions.has(PermissionFlagsBits.Administrator) ||
+    message.member.permissions.has(PermissionFlagsBits.ManageGuild)
+  );
+}
+
+// =============================================================================
+// SECTION 8: HELPERS
 // =============================================================================
 
 const SUPPORTED_IMAGES = new Set(["image/jpeg","image/png","image/webp","image/gif"]);
@@ -296,7 +363,7 @@ function chunkText(text, max = 1990) {
 }
 
 // =============================================================================
-// SECTION 7: DISCORD CLIENT
+// SECTION 9: DISCORD CLIENT
 // =============================================================================
 
 const client = new Client({
@@ -310,15 +377,15 @@ const client = new Client({
 
 client.once(Events.ClientReady, (c) => {
   console.log(`\n✅ Pixie is online! (${c.user.tag})`);
-  console.log(`   Guilds: ${c.guilds.cache.size}`);
-  console.log(`   Text:   ${TEXT_MODEL}`);
-  console.log(`   Vision: ${VISION_MODEL}`);
-  console.log(`   Token budget for history: ~${MAX_HISTORY_TOKENS}\n`);
+  console.log(`   Guilds:       ${c.guilds.cache.size}`);
+  console.log(`   Text model:   ${TEXT_MODEL}`);
+  console.log(`   Vision model: ${VISION_MODEL}`);
+  console.log(`   Owner ID:     ${BOT_OWNER_ID || "not set"}\n`);
   c.user.setActivity("CloutKart | AI Creatives", { type: ActivityType.Watching });
 });
 
 // =============================================================================
-// SECTION 8: MESSAGE HANDLER
+// SECTION 10: MESSAGE HANDLER
 // =============================================================================
 
 client.on(Events.MessageCreate, async (message) => {
@@ -331,30 +398,124 @@ client.on(Events.MessageCreate, async (message) => {
 
   const cmd = prompt.toLowerCase();
 
-  // ── Commands ──────────────────────────────────────────────────────────────
+  // ── !help ──────────────────────────────────────────────────────────────────
+  if (cmd.startsWith("!help")) {
+    const adminSection = isAuthorized(message)
+      ? "\n**Admin Commands**\n" +
+        "`!teach <fact>` — teach Pixie a new fact\n" +
+        "`!teach topic:<tag> <fact>` — teach with a topic tag (e.g. `topic:pricing`)\n" +
+        "`!knowledge` — list everything Pixie has been taught\n" +
+        "`!knowledge topic:<tag>` — filter by topic\n" +
+        "`!forget <number>` — remove a fact by its list number\n"
+      : "";
+
+    return message.reply(
+      "**Hey! I'm Pixie 👋 — CloutKart's AI creative assistant.**\n\n" +
+      "I can help you with ad concepts, hooks, creative strategy, campaign ideas, and more.\n\n" +
+      "**Commands**\n" +
+      "`!reset` — clear our conversation history\n" +
+      "`!help` — show this message\n" +
+      adminSection +
+      "\nOr just talk to me — mention me and ask anything.\n\n" +
+      "🌐 **www.clout-kart.com** | ✉️ inquiry@clout-kart.com"
+    );
+  }
+
+  // ── !reset ─────────────────────────────────────────────────────────────────
   if (cmd.startsWith("!reset")) {
     userHistories.delete(message.author.id);
     console.log(`[Chat] Reset for ${message.author.id}`);
     return message.reply("🔄 Conversation cleared! Fresh start ✨");
   }
 
-  if (cmd.startsWith("!help")) {
-    return message.reply(
-      "**Hey! I'm Pixie 👋 — CloutKart's AI creative assistant.**\n\n" +
-      "I can help you with ad concepts, hooks, creative strategy, campaign ideas, and more.\n\n" +
-      "**Commands**\n" +
-      "`!reset` — clear our conversation history\n" +
-      "`!help` — show this message\n\n" +
-      "Or just talk to me — mention me and ask anything.\n\n" +
-      "🌐 **www.clout-kart.com** | ✉️ inquiry@clout-kart.com"
-    );
+  // ── !teach ─────────────────────────────────────────────────────────────────
+  // Usage:  !teach <fact>
+  //         !teach topic:<tag> <fact>
+  if (cmd.startsWith("!teach")) {
+    if (!isAuthorized(message)) {
+      return message.reply("🔒 Only server admins or the bot owner can teach Pixie new things.");
+    }
+
+    let body = prompt.slice("!teach".length).trim();
+    if (!body) {
+      return message.reply(
+        "**Usage:**\n" +
+        "`!teach <fact>` — e.g. `!teach Our cheapest plan is $49/month`\n" +
+        "`!teach topic:<tag> <fact>` — e.g. `!teach topic:pricing Our cheapest plan is $49/month`"
+      );
+    }
+
+    let topic = "general";
+    const topicMatch = body.match(/^topic:(\S+)\s+([\s\S]+)$/i);
+    if (topicMatch) {
+      topic = topicMatch[1].toLowerCase();
+      body  = topicMatch[2].trim();
+    }
+
+    await saveFact(body, topic, message.author.tag);
+    console.log(`[Teach] "${body}" (topic: ${topic}) added by ${message.author.tag}`);
+    return message.reply(`✅ Got it! I've learned:\n> **[${topic}]** ${body}`);
   }
 
+  // ── !knowledge ─────────────────────────────────────────────────────────────
+  // Usage:  !knowledge
+  //         !knowledge topic:<tag>
+  if (cmd.startsWith("!knowledge")) {
+    if (!isAuthorized(message)) {
+      return message.reply("🔒 Only server admins or the bot owner can view Pixie's knowledge base.");
+    }
+
+    const topicFilter = prompt.match(/topic:(\S+)/i)?.[1];
+    const facts = topicFilter
+      ? await getFactsByTopic(topicFilter)
+      : await getAllFacts();
+
+    if (facts.length === 0) {
+      return message.reply(
+        topicFilter
+          ? `No facts found for topic \`${topicFilter}\`.`
+          : "I haven't been taught anything yet. Use `!teach` to add facts."
+      );
+    }
+
+    const header = topicFilter
+      ? `📚 **Pixie's knowledge — topic: \`${topicFilter}\`** (${facts.length} facts)\n\n`
+      : `📚 **Pixie's full knowledge base** (${facts.length} facts)\n\n`;
+
+    const list = facts.map((f, i) => `**${i + 1}.** ${f}`).join("\n");
+    const chunks = chunkText(header + list);
+    for (let i = 0; i < chunks.length; i++) {
+      await (i === 0 ? message.reply(chunks[i]) : message.channel.send(chunks[i]));
+    }
+    return;
+  }
+
+  // ── !forget ────────────────────────────────────────────────────────────────
+  // Usage:  !forget <number>
+  if (cmd.startsWith("!forget")) {
+    if (!isAuthorized(message)) {
+      return message.reply("🔒 Only server admins or the bot owner can remove facts.");
+    }
+
+    const num = parseInt(prompt.split(/\s+/)[1], 10);
+    if (isNaN(num) || num < 1) {
+      return message.reply("**Usage:** `!forget <number>` — use `!knowledge` to find the number.");
+    }
+
+    const deleted = await deleteFact(num);
+    if (!deleted) {
+      return message.reply(`❌ No fact found at position **${num}**. Use \`!knowledge\` to check the list.`);
+    }
+    console.log(`[Forget] Fact #${num} removed by ${message.author.tag}`);
+    return message.reply(`🗑️ Fact **#${num}** has been removed from my knowledge base.`);
+  }
+
+  // ── Empty message guard ────────────────────────────────────────────────────
   if (!prompt && message.attachments.size === 0) {
     return message.reply("Hey! Ask me something or attach an image — I'm here 🙌");
   }
 
-  // ── Typing indicator ──────────────────────────────────────────────────────
+  // ── Typing indicator ───────────────────────────────────────────────────────
   let typing;
   try {
     await message.channel.sendTyping();
@@ -364,15 +525,12 @@ client.on(Events.MessageCreate, async (message) => {
   const done = () => clearInterval(typing);
 
   try {
-    // ── Build user content ──────────────────────────────────────────────────
+    // ── Build user content ───────────────────────────────────────────────────
     let userContent;
     let hasImages = false;
 
     if (message.attachments.size > 0) {
-      const parts = [{
-        type: "text",
-        text: prompt || "Describe this image in detail.",
-      }];
+      const parts = [{ type: "text", text: prompt || "Describe this image in detail." }];
 
       for (const [, att] of message.attachments) {
         const mime = att.contentType?.split(";")[0];
@@ -391,19 +549,14 @@ client.on(Events.MessageCreate, async (message) => {
       userContent = prompt;
     }
 
-    // ── Get history and call Groq ───────────────────────────────────────────
+    // ── Call Groq ────────────────────────────────────────────────────────────
     const history = getHistory(message.author.id);
-
     console.log(`[Groq] ${message.author.tag} | stored turns=${history.length / 2} images=${hasImages}`);
 
     const reply = await askGroq(history, hasImages, userContent);
-
-    // Commit to history as plain strings only
     pushToHistory(message.author.id, userContent, reply);
-
     done();
 
-    // ── Send response ───────────────────────────────────────────────────────
     const chunks = chunkText(reply);
     for (let i = 0; i < chunks.length; i++) {
       await (i === 0 ? message.reply(chunks[i]) : message.channel.send(chunks[i]));
@@ -414,27 +567,32 @@ client.on(Events.MessageCreate, async (message) => {
     console.error(`[Error] ${message.author.tag}:`, err);
 
     let msg = "❌ Something went wrong. Please try again.";
-    if (err?.status === 429)                               msg = "⏳ Rate limited — wait a moment and try again.";
-    if (err?.status === 401)                               msg = "❌ Bad API key — contact the bot admin.";
-    if (err?.status === 503)                               msg = "🔧 Groq is overloaded — try again in a few seconds.";
-    if (err?.message?.includes("decommissioned"))          msg = "❌ Model retired — contact the bot admin to update.";
-    if (err?.message?.includes("Image fetch"))             msg = "❌ Couldn't download your image. Try re-uploading it.";
-    if (err?.code === 50013)                               msg = "❌ Missing permission to send messages here.";
+    if (err?.status === 429)                      msg = "⏳ Rate limited — wait a moment and try again.";
+    if (err?.status === 401)                      msg = "❌ Bad API key — contact the bot admin.";
+    if (err?.status === 503)                      msg = "🔧 Groq is overloaded — try again in a few seconds.";
+    if (err?.message?.includes("decommissioned")) msg = "❌ Model retired — contact the bot admin to update.";
+    if (err?.message?.includes("Image fetch"))    msg = "❌ Couldn't download your image. Try re-uploading it.";
+    if (err?.code === 50013)                      msg = "❌ Missing permission to send messages here.";
 
     try { await message.reply(msg); } catch { /* already logged */ }
   }
 });
 
 // =============================================================================
-// SECTION 9: PROCESS SAFETY
+// SECTION 11: PROCESS SAFETY
 // =============================================================================
 
 process.on("unhandledRejection", (r) => console.error("[Process] Unhandled rejection:", r));
 process.on("uncaughtException",  (e) => console.error("[Process] Uncaught exception:",  e));
 
 // =============================================================================
-// SECTION 10: LOGIN
+// SECTION 12: BOOT
 // =============================================================================
 
 console.log("🚀 Starting Pixie...");
-client.login(DISCORD_TOKEN);
+connectMongo()
+  .then(() => client.login(DISCORD_TOKEN))
+  .catch((err) => {
+    console.error("[FATAL] MongoDB connection failed:", err);
+    process.exit(1);
+  });
